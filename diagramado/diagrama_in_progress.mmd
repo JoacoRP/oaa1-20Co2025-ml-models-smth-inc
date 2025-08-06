@@ -1,0 +1,77 @@
+graph TB
+    %% Definición de estilos
+    classDef external fill:#e1f5fe,stroke:#01579b,stroke-width:2px
+    classDef service fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+    classDef storage fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
+    classDef ml fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef api fill:#fce4ec,stroke:#880e4f,stroke-width:2px
+
+    %% Fuentes de datos externas
+    UCI[UCI Machine Learning Repository<br/>Heart Disease Dataset]:::external
+    
+    %% Servicios principales
+    subgraph "ML Models and something more Inc."
+        subgraph "DataOps & MLOps Platform"
+            AIRFLOW[Apache Airflow<br/>Orchestration & Scheduling]:::service
+            MLFLOW[MLflow<br/>Model Registry & Experiment Tracking]:::ml
+        end
+        
+        subgraph "Data Lake"
+            S3[S3/MinIO<br/>Data Lake Storage]:::storage
+        end
+        
+        subgraph "ML Pipeline"
+            ETL[ETL Pipeline<br/>Data Processing]:::service
+            TRAIN[Model Training<br/>with Optuna]:::ml
+            API[FastAPI Service<br/>Model Inference]:::api
+        end
+        
+        subgraph "DAGs"
+            ETL_DAG[process_etl_heart_data<br/>Data Ingestion & Processing]:::service
+            RETRAIN_DAG[retrain_the_model<br/>Model Retraining]:::service
+        end
+    end
+    
+    %% Clientes/Usuarios
+    CLIENT[API Client<br/>Prediction Requests]:::external
+    
+    %% Conexiones principales
+    UCI --> ETL_DAG
+    ETL_DAG --> S3
+    ETL_DAG --> MLFLOW
+    
+    S3 --> TRAIN
+    TRAIN --> MLFLOW
+    MLFLOW --> API
+    
+    RETRAIN_DAG --> S3
+    RETRAIN_DAG --> MLFLOW
+    MLFLOW --> API
+    
+    API --> CLIENT
+    
+    %% Conexiones internas
+    AIRFLOW --> ETL_DAG
+    AIRFLOW --> RETRAIN_DAG
+    
+    %% Flujo de datos
+    subgraph "Data Flow"
+        direction LR
+        DATA[Raw Data] --> CLEAN[Cleaned Data] --> FEATURES[Feature Engineering] --> TRAIN_TEST[Train/Test Split]
+    end
+    
+    %% Flujo de modelos
+    subgraph "Model Lifecycle"
+        direction LR
+        EXPERIMENT[MLflow Experiments] --> REGISTER[Model Registry] --> DEPLOY[Model Deployment] --> MONITOR[Model Monitoring]
+    end
+    
+    %% Notas explicativas
+    classDef note fill:#fff9c4,stroke:#f57f17,stroke-width:1px
+    NOTE1[Heart Disease Prediction<br/>Binary Classification]:::note
+    NOTE2[Champion/Challenger<br/>Model Comparison]:::note
+    NOTE3[REST API<br/>Single Prediction Endpoint]:::note
+    
+    NOTE1 -.-> API
+    NOTE2 -.-> RETRAIN_DAG
+    NOTE3 -.-> API
