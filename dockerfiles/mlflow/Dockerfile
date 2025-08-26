@@ -1,9 +1,16 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
+
+WORKDIR /app
 
 COPY requirements.txt /requirements.txt
-RUN apt-get update && apt-get install -y wget
-RUN pip install --upgrade pip
-RUN pip install mlflow[extras]
-RUN pip install --no-cache-dir -r /requirements.txt
+
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r /requirements.txt
 
 EXPOSE 5000
+
+CMD mlflow server \
+    --backend-store-uri postgresql://airflow:airflow@postgres:5432/mlflow_db \
+    --default-artifact-root s3://mlflow/ \
+    --host 0.0.0.0 \
+    --port 5000

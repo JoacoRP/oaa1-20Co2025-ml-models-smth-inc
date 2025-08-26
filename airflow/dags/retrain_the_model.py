@@ -1,240 +1,219 @@
-import datetime
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+import boto3
+import pandas as pd
+from io import BytesIO
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.model_selection import GridSearchCV
+import mlflow
+from mlflow.tracking import MlflowClient
+import mlflow.sklearn
 
-from airflow.decorators import dag, task
+# --- Configuración global ---
+BUCKET_NAME = "data"
+TRAIN_FILE = "train.csv"
+TEST_FILE = "test.csv"
+TARGET_COLUMN = "Sales"
+MODEL_NAME = "steam_sales_prediction_model_prod"
 
-markdown_text = """
-### Re-Train the Model for Heart Disease Data
+MLFLOW_TRACKING_URI = "http://mlflow:5000"
 
-This DAG re-trains the model based on new data, tests the previous model, and put in production the new one 
-if it performs  better than the old one. It uses the F1 score to evaluate the model with the test data.
+# --- Funciones auxiliares ---
+def load_dataset_from_minio(file_name):
+    """
+    Carga un archivo CSV desde MinIO y devuelve un DataFrame de pandas.
 
-"""
+    Args:
+        file_name (str): Nombre del archivo CSV a cargar desde el bucket configurado.
 
+    Returns:
+        pd.DataFrame: DataFrame con los datos cargados desde MinIO.
+    """
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url="http://s3:9000",
+        aws_access_key_id="minio",
+        aws_secret_access_key="minio123"
+    )
+    obj = s3.get_object(Bucket=BUCKET_NAME, Key=file_name)
+    return pd.read_csv(BytesIO(obj['Body'].read()))
+
+def train_sales_model(**kwargs):
+    """
+    Entrena un modelo de RandomForestRegressor utilizando GridSearchCV y loguea la ejecución en MLflow.
+
+    - Carga los datasets de entrenamiento y prueba desde MinIO.
+    - Realiza búsqueda de hiperparámetros con validación cruzada.
+    - Calcula y loguea métricas (MSE, RMSE, R2) en MLflow.
+    - Registra el modelo entrenado en el Model Registry de MLflow.
+    - Envía el run_id y el RMSE del challenger al siguiente task mediante XCom.
+
+    Args:
+        kwargs (dict): Contexto de Airflow que incluye `ti` (task instance) para usar XCom.
+    """
+    
+    # Cargar datasets
+    train_df = load_dataset_from_minio(TRAIN_FILE)
+    test_df = load_dataset_from_minio(TEST_FILE)
+
+    # Preparar datos
+    X_train = train_df.drop(columns=[TARGET_COLUMN]).select_dtypes(include=["number"])
+    y_train = train_df[TARGET_COLUMN]
+    X_test = test_df.drop(columns=[TARGET_COLUMN]).select_dtypes(include=["number"])
+    y_test = test_df[TARGET_COLUMN]
+
+    # Configurar MLflow
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    mlflow.set_experiment("Sales Prediction")
+
+    with mlflow.start_run() as run:
+        # Definir la grilla de hiperparámetros
+        param_grid = {
+            "n_estimators":      [100, 200],
+            "max_depth":         [None, 10, 20],
+            "min_samples_split": [2, 5]
+        }
+
+        # GridSearch con validación cruzada
+        grid = GridSearchCV(
+            RandomForestRegressor(random_state=42),
+            param_grid,
+            cv=5,
+            n_jobs=-1,
+            scoring="neg_mean_squared_error"
+        )
+        grid.fit(X_train, y_train)
+        best_model = grid.best_estimator_
+
+        # Métricas
+        cv_mse   = -grid.best_score_
+        cv_rmse  = cv_mse ** 0.5
+        y_pred   = best_model.predict(X_test)
+        test_mse = mean_squared_error(y_test, y_pred)
+        test_rmse = test_mse ** 0.5
+        test_r2  = r2_score(y_test, y_pred)
+
+        # Log en MLflow
+        mlflow.log_params(grid.best_params_)
+        mlflow.log_metric("cv_mse", cv_mse)
+        mlflow.log_metric("cv_rmse", cv_rmse)
+        mlflow.log_metric("mse", test_mse)
+        mlflow.log_metric("rmse", test_rmse)
+        mlflow.log_metric("r2", test_r2)
+        mlflow.sklearn.log_model(best_model, artifact_path="modelo_random_forest")
+
+        run_id = run.info.run_id
+        mlflow.end_run()
+
+        # Registrar modelo en el registry
+        client = MlflowClient()
+        
+        try:
+            client.get_registered_model(MODEL_NAME)
+        except mlflow.exceptions.RestException as e:
+            if e.error_code == "RESOURCE_DOES_NOT_EXIST":
+                client.create_registered_model(MODEL_NAME)
+
+        client.create_model_version(
+            name=MODEL_NAME,
+            source=f"{run.info.artifact_uri}/modelo_random_forest",
+            run_id=run_id
+        )
+
+        # Guardar el run_id y rmse para el siguiente task
+        kwargs['ti'].xcom_push(key='challenger_run_id', value=run_id)
+        kwargs['ti'].xcom_push(key='challenger_rmse', value=test_rmse)
+
+def compare_and_promote_model(**kwargs):
+    """
+    Compara el modelo challenger entrenado con el modelo champion actual en producción.
+
+    - Obtiene el RMSE del challenger desde XCom.
+    - Recupera el modelo champion actual desde el Model Registry de MLflow.
+    - Si el challenger tiene mejor RMSE que el champion, lo promueve a Production y archiva el anterior.
+    - Si no existe un champion, promueve directamente el challenger.
+
+    Args:
+        kwargs (dict): Contexto de Airflow que incluye `ti` (task instance) para usar XCom.
+    """
+
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    client = MlflowClient()
+
+    # Obtener challenger info desde XCom
+    challenger_run_id = kwargs['ti'].xcom_pull(key='challenger_run_id')
+    challenger_rmse = kwargs['ti'].xcom_pull(key='challenger_rmse')
+
+    # Registrar el modelo si no existe
+    try:
+        client.get_registered_model(MODEL_NAME)
+    except mlflow.exceptions.RestException as e:
+        if e.error_code == "RESOURCE_DOES_NOT_EXIST":
+            client.create_registered_model(MODEL_NAME)
+
+    # Buscar el champion actual
+    try:
+        latest_versions = client.get_latest_versions(name=MODEL_NAME, stages=["Production"])
+        champion = latest_versions[0] if latest_versions else None
+    except mlflow.exceptions.RestException:
+        champion = None
+
+    # Buscar la versión del challenger en el registry
+    challenger_versions = client.search_model_versions(f"run_id='{challenger_run_id}'")
+    challenger_version = list(challenger_versions)[0].version
+
+    if champion:
+        # Obtener el RMSE del champion
+        champion_metrics = client.get_run(champion.run_id).data.metrics
+        champion_rmse = champion_metrics.get("rmse")
+
+        if champion_rmse is None:
+            print("Champion no tiene RMSE registrado. Promoviendo challenger a Production...")
+            client.transition_model_version_stage(name=MODEL_NAME, version=challenger_version, stage="Production")
+            return
+
+        print(f"Champion RMSE: {champion_rmse} | Challenger RMSE: {challenger_rmse}")
+
+        # Comparar y promover si el challenger es mejor
+        if challenger_rmse < champion_rmse:
+            print("Challenger es mejor. Promoviendo a Production...")
+            client.transition_model_version_stage(name=MODEL_NAME, version=champion.version, stage="Archived")
+            client.transition_model_version_stage(name=MODEL_NAME, version=challenger_version, stage="Production")
+        else:
+            print("El champion sigue siendo mejor. No se promueve el challenger.")
+    else:
+        # Si no hay champion, promover directamente al challenger
+        print("No hay champion actual. Promoviendo challenger a Production...")
+        client.transition_model_version_stage(name=MODEL_NAME, version=challenger_version, stage="Production")
+
+# --- DAG definition ---
 default_args = {
-    'owner': "Facundo Adrian Lucianna",
-    'depends_on_past': False,
-    'schedule_interval': None,
-    'retries': 1,
-    'retry_delay': datetime.timedelta(minutes=5),
-    'dagrun_timeout': datetime.timedelta(minutes=15)
+    "owner": "airflow",
+    "depends_on_past": False
 }
 
-@dag(
-    dag_id="retrain_the_model",
-    description="Re-train the model based on new data, tests the previous model, and put in production the new one if "
-                "it performs better than the old one",
-    doc_md=markdown_text,
-    tags=["Re-Train", "Heart Disease"],
+with DAG(
+    dag_id="retrain_and_promote_sales_model",
     default_args=default_args,
+    description="Reentrena, evalúa y promueve el modelo de predicción de ventas de videojuegos",
+    schedule_interval=None,
+    is_paused_upon_creation=False,
+    start_date=datetime(2025, 4, 1),
     catchup=False,
-)
-def processing_dag():
+    tags=["mlflow", "sales", "retraining", "manual"]
+) as dag:
 
-    @task.virtualenv(
-        task_id="train_the_challenger_model",
-        requirements=["scikit-learn==1.3.2",
-                      "mlflow==2.10.2",
-                      "awswrangler==3.6.0"],
-        system_site_packages=True
+    retrain_model = PythonOperator(
+        task_id="train_sales_model",
+        python_callable=train_sales_model
     )
-    def train_the_challenger_model():
-        import datetime
-        import mlflow
-        import awswrangler as wr
 
-        from sklearn.base import clone
-        from sklearn.metrics import f1_score
-        from mlflow.models import infer_signature
-
-        mlflow.set_tracking_uri('http://mlflow:5000')
-
-        def load_the_champion_model():
-
-            model_name = "heart_disease_model_prod"
-            alias = "champion"
-
-            client = mlflow.MlflowClient()
-            model_data = client.get_model_version_by_alias(model_name, alias)
-
-            champion_version = mlflow.sklearn.load_model(model_data.source)
-
-            return champion_version
-
-        def load_the_train_test_data():
-            X_train = wr.s3.read_csv("s3://data/final/train/heart_X_train.csv")
-            y_train = wr.s3.read_csv("s3://data/final/train/heart_y_train.csv")
-            X_test = wr.s3.read_csv("s3://data/final/test/heart_X_test.csv")
-            y_test = wr.s3.read_csv("s3://data/final/test/heart_y_test.csv")
-
-            return X_train, y_train, X_test, y_test
-
-        def mlflow_track_experiment(model, X):
-
-            # Track the experiment
-            experiment = mlflow.set_experiment("Heart Disease")
-
-            mlflow.start_run(run_name='Challenger_run_' + datetime.datetime.today().strftime('%Y/%m/%d-%H:%M:%S"'),
-                             experiment_id=experiment.experiment_id,
-                             tags={"experiment": "challenger models", "dataset": "Heart disease"},
-                             log_system_metrics=True)
-
-            params = model.get_params()
-            params["model"] = type(model).__name__
-
-            mlflow.log_params(params)
-
-            # Save the artifact of the challenger model
-            artifact_path = "model"
-
-            signature = infer_signature(X, model.predict(X))
-
-            mlflow.sklearn.log_model(
-                sk_model=model,
-                artifact_path=artifact_path,
-                signature=signature,
-                serialization_format='cloudpickle',
-                registered_model_name="heart_disease_model_dev",
-                metadata={"model_data_version": 1}
-            )
-
-            # Obtain the model URI
-            return mlflow.get_artifact_uri(artifact_path)
-
-        def register_challenger(model, f1_score, model_uri):
-
-            client = mlflow.MlflowClient()
-            name = "heart_disease_model_prod"
-
-            # Save the model params as tags
-            tags = model.get_params()
-            tags["model"] = type(model).__name__
-            tags["f1-score"] = f1_score
-
-            # Save the version of the model
-            result = client.create_model_version(
-                name=name,
-                source=model_uri,
-                run_id=model_uri.split("/")[-3],
-                tags=tags
-            )
-
-            # Save the alias as challenger
-            client.set_registered_model_alias(name, "challenger", result.version)
-
-        # Load the champion model
-        champion_model = load_the_champion_model()
-
-        # Clone the model
-        challenger_model = clone(champion_model)
-
-        # Load the dataset
-        X_train, y_train, X_test, y_test = load_the_train_test_data()
-
-        # Fit the training model
-        challenger_model.fit(X_train, y_train.to_numpy().ravel())
-
-        # Obtain the metric of the model
-        y_pred = challenger_model.predict(X_test)
-        f1_score = f1_score(y_test.to_numpy().ravel(), y_pred)
-
-        # Track the experiment
-        artifact_uri = mlflow_track_experiment(challenger_model, X_train)
-
-        # Record the model
-        register_challenger(challenger_model, f1_score, artifact_uri)
-
-
-    @task.virtualenv(
-        task_id="train_the_challenger_model",
-        requirements=["scikit-learn==1.3.2",
-                      "mlflow==2.10.2",
-                      "awswrangler==3.6.0"],
-        system_site_packages=True
+    promote_model = PythonOperator(
+        task_id="compare_and_promote_model",
+        python_callable=compare_and_promote_model
     )
-    def evaluate_champion_challenge():
-        import mlflow
-        import awswrangler as wr
 
-        from sklearn.metrics import f1_score
-
-        mlflow.set_tracking_uri('http://mlflow:5000')
-
-        def load_the_model(alias):
-            model_name = "heart_disease_model_prod"
-
-            client = mlflow.MlflowClient()
-            model_data = client.get_model_version_by_alias(model_name, alias)
-
-            model = mlflow.sklearn.load_model(model_data.source)
-
-            return model
-
-        def load_the_test_data():
-            X_test = wr.s3.read_csv("s3://data/final/test/heart_X_test.csv")
-            y_test = wr.s3.read_csv("s3://data/final/test/heart_y_test.csv")
-
-            return X_test, y_test
-
-        def promote_challenger(name):
-
-            client = mlflow.MlflowClient()
-
-            # Demote the champion
-            client.delete_registered_model_alias(name, "champion")
-
-            # Load the challenger from registry
-            challenger_version = client.get_model_version_by_alias(name, "challenger")
-
-            # delete the alias of challenger
-            client.delete_registered_model_alias(name, "challenger")
-
-            # Transform in champion
-            client.set_registered_model_alias(name, "champion", challenger_version.version)
-
-        def demote_challenger(name):
-
-            client = mlflow.MlflowClient()
-
-            # delete the alias of challenger
-            client.delete_registered_model_alias(name, "challenger")
-
-        # Load the champion model
-        champion_model = load_the_model("champion")
-
-        # Load the challenger model
-        challenger_model = load_the_model("challenger")
-
-        # Load the dataset
-        X_test, y_test = load_the_test_data()
-
-        # Obtain the metric of the models
-        y_pred_champion = champion_model.predict(X_test)
-        f1_score_champion = f1_score(y_test.to_numpy().ravel(), y_pred_champion)
-
-        y_pred_challenger = challenger_model.predict(X_test)
-        f1_score_challenger = f1_score(y_test.to_numpy().ravel(), y_pred_challenger)
-
-        experiment = mlflow.set_experiment("Heart Disease")
-
-        # Obtain the last experiment run_id to log the new information
-        list_run = mlflow.search_runs([experiment.experiment_id], output_format="list")
-
-        with mlflow.start_run(run_id=list_run[0].info.run_id):
-            mlflow.log_metric("test_f1_challenger", f1_score_challenger)
-            mlflow.log_metric("test_f1_champion", f1_score_champion)
-
-            if f1_score_challenger > f1_score_champion:
-                mlflow.log_param("Winner", 'Challenger')
-            else:
-                mlflow.log_param("Winner", 'Champion')
-
-        name = "heart_disease_model_prod"
-        if f1_score_challenger > f1_score_champion:
-            promote_challenger(name)
-        else:
-            demote_challenger(name)
-
-    train_the_challenger_model() >> evaluate_champion_challenge()
-
-
-my_dag = processing_dag()
+    retrain_model >> promote_model

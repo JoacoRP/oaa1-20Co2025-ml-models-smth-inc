@@ -1,16 +1,13 @@
-FROM apache/airflow:3.0.2
-COPY requirements.txt /requirements.txt
+FROM apache/airflow:2.8.1
 
 USER root
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends \
-         git \
-  && apt-get autoremove -yqq --purge \
+  && apt-get install -y --no-install-recommends git \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 
 USER airflow
 COPY requirements.txt /requirements.txt
+RUN pip install --no-cache-dir  --user -r /requirements.txt
 
-RUN pip install --upgrade pip
-RUN pip install --no-cache-dir apache-airflow[virtualenv]==3.0.2 -r /requirements.txt
+ENV AIRFLOW__WEBSERVER__SECRET_KEY=51905fa766adeb2087a2ea175b85d69c

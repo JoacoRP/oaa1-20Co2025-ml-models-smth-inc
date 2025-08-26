@@ -1,0 +1,30 @@
+[theme]
+# Color principal (Botones, acentos, etc.).
+primaryColor="#0055A4"
+
+# Color del fondo de la aplicación.
+backgroundColor="#FFFFFF"
+
+# Color del fondo de elementos secundarios (barras laterales, contenedores de código).
+secondaryBackgroundColor="#F0F2F6"
+
+# Color del texto.
+textColor="#262626"
+
+# Color de los enlaces y texto interactivo
+linkColor="#007BFF" 
+
+# Color de advertencia o para resaltar información.
+infoColor="#FFC107"
+
+# Color para indicar éxito.
+successColor="#28A745"
+
+# Color para indicar errores.
+errorColor="#DC3545"
+
+# Tipo de fuente.
+font="sans serif"
+
+# Por defecto dejarlo en darkmode
+base="dark"
