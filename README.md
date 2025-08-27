@@ -41,7 +41,7 @@ Mediante el uso de las diversas herramientas del proyecto se logro gestionar y a
 - Docker y Docker Compose instalados.
 
 ## Entorno de desarrollo utilizado
-- SO: Winfows 11
+- SO: Windows 11
 - Docker faclitado con Docker Desktop
 
 ## Forma de uso
@@ -50,7 +50,7 @@ Mediante el uso de las diversas herramientas del proyecto se logro gestionar y a
 1. Clonar el repositorio y levantar los servicios necesarios utilizando Docker Compose:
 
 ```bash
-git clone JoacoRP/oaa1-20Co2025-ml-models-smth-inc.git
+git clone https://github.com/JoacoRP/oaa1-20Co2025-ml-models-smth-inc.git
 cd oaa1-20Co2025-ml-models-smth-inc
 docker compose up --build
 ```
